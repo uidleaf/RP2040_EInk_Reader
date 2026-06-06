@@ -1,0 +1,235 @@
+============================================================
+  RP2040 墨水屏阅读器 — 编译 & 烧录教程
+  基于 Raspberry Pi Pico SDK
+  最后更新: 2026-06-05
+============================================================
+
+一、环境准备
+------------------------------------------------------------
+
+需要安装以下工具：
+
+  1. ARM GCC 工具链 (arm-none-eabi-gcc)
+     https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads
+     安装后确保 arm-none-eabi-gcc 在系统 PATH 中。
+     验证: 命令行输入  arm-none-eabi-gcc --version
+
+  2. CMake (≥ 3.13)
+     https://cmake.org/download/
+     验证: 命令行输入  cmake --version
+
+  3. Ninja (构建加速器)
+     https://github.com/ninja-build/ninja/releases
+     将 ninja.exe 放到 PATH 目录下。
+     验证: 命令行输入  ninja --version
+
+  4. Git
+     https://git-scm.com/download/win
+     验证: 命令行输入  git --version
+
+  5. Python (≥ 3.8)
+     https://www.python.org/downloads/
+     用于 UF2 格式转换（picotool 在某些 Windows 系统上会崩溃）。
+     验证: 命令行输入  python --version
+
+
+二、获取 Pico SDK
+------------------------------------------------------------
+
+  # 在任意无中文路径下执行（ARM GCC 不支持中文路径！）
+  cd C:\
+  git clone --depth 1 https://github.com/raspberrypi/pico-sdk.git
+  cd pico-sdk
+  git submodule update --init
+
+
+三、项目结构
+------------------------------------------------------------
+
+  RP2040\
+  ├── CMakeLists.txt          # CMake 构建脚本
+  ├── pico_sdk_import.cmake   # SDK 导入脚本
+  ├── DEV_Config.h            # 引脚 & 宏定义
+  ├── DEV_Config.c            # SPI / GPIO 硬件初始化
+  ├── EPD_2in9.h              # 墨水屏驱动接口
+  ├── EPD_2in9.c              # 墨水屏驱动实现
+  ├── ui.h                    # UI 接口
+  ├── ui.c                    # UI 实现 (页面、字体、交互)
+  ├── main.c                  # 主程序 (按键、时钟、主循环)
+  └── build\                  # 构建输出目录
+      └── eink_reader.uf2     # ← 烧录文件
+
+
+四、引脚映射
+------------------------------------------------------------
+
+  RP2040 引脚        墨水屏        功能
+  ────────────────────────────────────────
+  GP2                PA5 (SCK)     SPI 时钟
+  GP3                PA7 (MOSI)    SPI 数据输出
+  GP4                PA4 (CS)      片选
+  GP5                PA3 (DC)      数据/命令选择
+  GP6                PA2 (RST)     复位
+  GP7                PA1 (BUSY)    忙信号检测
+  GP0                —             按键 (低电平有效)
+
+
+五、编译步骤 (CMD / PowerShell)
+------------------------------------------------------------
+
+  1. 打开命令行，进入项目目录：
+
+     cd C:\path\to\RP2040
+
+  2. 创建并进入 build 目录：
+
+     mkdir build
+     cd build
+
+  3. 运行 CMake 配置（注意替换 PICO_SDK_PATH）：
+
+     cmake -G "Ninja" ^
+       -DPICO_SDK_PATH=C:/pico-sdk ^
+       -DCMAKE_DISABLE_FIND_PACKAGE_Doxygen=ON ^
+       ..
+
+     参数说明：
+       -G "Ninja"               使用 Ninja 构建系统
+       -DPICO_SDK_PATH=...      指定 Pico SDK 路径
+       -DCMAKE_DISABLE_...      跳过 Doxygen（避免路径问题）
+
+  4. 编译：
+
+     ninja
+
+     * 注意：picotool 可能在最后一步崩溃（UF2 转换），
+       这不影响编译本身。可以使用备用脚本（见第六节）。
+
+  5. 输出文件在 build\ 目录下：
+
+     eink_reader.elf   — ELF 调试文件
+     eink_reader.bin   — 原始固件
+     eink_reader.uf2   — UF2 烧录文件
+
+
+六、UF2 备用生成方法 (Python)
+------------------------------------------------------------
+
+  如果 picotool 崩溃，在 build 目录下运行以下 Python 脚本：
+
+  --- 保存为 convert_uf2.py ---
+  import struct
+
+  with open('eink_reader.bin', 'rb') as f:
+      data = f.read()
+
+  FAMILY_ID = 0xE48BFF56          # RP2040
+  UF2_MAGIC_START0 = 0x0A324655
+  UF2_MAGIC_START1 = 0x9E5D5157
+  UF2_MAGIC_END    = 0x0AB16F30
+  UF2_PAYLOAD_SIZE = 256
+  FLASH_BASE       = 0x10000000
+
+  total_blocks = (len(data) + 255) // 256
+
+  with open('eink_reader.uf2', 'wb') as f:
+      for i in range(total_blocks):
+          block = bytearray(512)
+          struct.pack_into('<I', block,  0, UF2_MAGIC_START0)
+          struct.pack_into('<I', block,  4, UF2_MAGIC_START1)
+          struct.pack_into('<I', block,  8, 0x00002000)
+          struct.pack_into('<I', block, 12, FLASH_BASE + i * 256)
+          struct.pack_into('<I', block, 16, UF2_PAYLOAD_SIZE)
+          struct.pack_into('<I', block, 20, i)
+          struct.pack_into('<I', block, 24, total_blocks)
+          struct.pack_into('<I', block, 28, FAMILY_ID)
+          start = i * 256
+          end = min(start + 256, len(data))
+          block[32:32+(end-start)] = data[start:end]
+          struct.pack_into('<I', block, 508, UF2_MAGIC_END)
+          f.write(block)
+
+  print(f'UF2 done: {total_blocks} blocks, {len(data)} bytes')
+  ---
+
+  运行:
+  python convert_uf2.py
+
+
+七、烧录到 RP2040
+------------------------------------------------------------
+
+  1. 按住 RP2040 上的 BOOTSEL 按钮
+  2. 用 USB 线连接电脑（或按一下 RESET 再松开）
+  3. 松开 BOOTSEL 按钮
+  4. 电脑会弹出一个名为 RPI-RP2 的 U 盘
+  5. 将 eink_reader.uf2 拖入 RPI-RP2 磁盘
+  6. RP2040 自动重启，墨水屏显示主界面
+
+
+八、按键操作说明
+------------------------------------------------------------
+
+  单击     → 确认 / 选择
+  双击     → 下一项（两次快速按下，间隔 < 400ms）
+  长按     → 返回主页（按住 ≥ 800ms）
+
+  各页面操作：
+  ─────────────────────────────────────────────
+  主页:
+    单击 → 进入设置      双击 → 进入目录
+
+  设置:
+    单击 → 保存并返回    双击 → 切换设置项
+    长按 → 返回(不保存)
+
+  目录:
+    单击 → 确认章节      双击 → 下一章节
+    长按 → 返回主页
+
+  阅读:
+    单击 → 下一页        双击 → 下一章
+    长按 → 返回主页
+
+
+九、故障排查
+------------------------------------------------------------
+
+  问题: "arm-none-eabi-gcc not found"
+  → ARM GCC 未安装或不在 PATH。重新安装并添加到系统环境变量。
+
+  问题: fatal error: ... config_autogen.h ... Invalid argument
+  → 项目路径包含中文字符。将项目复制到纯英文路径下重新编译。
+
+  问题: "Pico SDK location not specified"
+  → CMake 找不到 Pico SDK。确保 -DPICO_SDK_PATH 指向正确的目录。
+
+  问题: picotool 崩溃 (exit code 3221225477)
+  → 这是 picotool 和某些 Windows 的兼容性问题。.elf/.bin 已正确
+     生成，用第六节的 Python 脚本生成 .uf2 即可。
+
+  问题: 墨水屏不显示
+  → 检查 SPI 连线（SCK=GP2, MOSI=GP3），确保 BUSY 引脚（GP7）
+     有上拉，RST 引脚（GP6）正确初始化。
+
+  问题: 按键无响应
+  → GP0 应配置为输入上拉模式，按下时接地。检查硬件连接。
+
+
+十、快速命令参考
+------------------------------------------------------------
+
+  # 首次配置
+  cd RP2040\build
+  cmake -G "Ninja" -DPICO_SDK_PATH=C:/pico-sdk -DCMAKE_DISABLE_FIND_PACKAGE_Doxygen=ON ..
+
+  # 编译
+  ninja
+
+  # 生成 UF2（备用）
+  python convert_uf2.py
+
+  # 全部一键（编译 + 生成 UF2）
+  ninja ; python convert_uf2.py
+
+============================================================
