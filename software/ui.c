@@ -21,16 +21,13 @@
 
 #define PARTIALS_BEFORE_FULL 5
 
-// ============================================================
-// 界面状态定义
-// ============================================================
 typedef enum {
-    PAGE_MAIN = 0,         // 主页面
-    PAGE_SETTINGS,         // 设置页面
-    PAGE_TOC,              // 目录页面
-    PAGE_READING,          // 阅读页面
-    PAGE_FILE_BROWSER,     // 文件浏览器页面
-    PAGE_RESUME_PROMPT     // 恢复阅读提示页面
+    PAGE_MAIN = 0,
+    PAGE_SETTINGS,
+    PAGE_TOC,
+    PAGE_READING,
+    PAGE_FILE_BROWSER,
+    PAGE_RESUME_PROMPT
 } UI_Page;
 
 #define MAX_BROWSER_ITEMS 50
@@ -43,7 +40,7 @@ static UI_FileItem browser_items[MAX_BROWSER_ITEMS];
 static int browser_item_count = 0;
 static int browser_index = 0;
 
-enum { FILTER_NONE = 0, FILTER_TXT, FILTER_JSON };
+enum { FILTER_NONE = 0, FILTER_TXT, FILTER_JSON, FILTER_JSON_CMD };
 static int file_filter_mode = FILTER_NONE;
 static uint8_t settings_index = 0;
 
@@ -76,16 +73,16 @@ typedef struct {
 } Glyph8x16;
 
 
-static uint8_t frame[FRAME_BYTES];           // 屏幕显示缓存
-static UI_DateTime current_time;             // 当前时间
-static UI_LastRead last_read;                // 最后阅读记录
-static UI_Page current_page = PAGE_MAIN;     // 当前界面状态
-static uint16_t toc_highlight = 1;           // 目录高亮位置
-static uint8_t partial_count = 0;            // 局刷次数统计
-static int sd_mounted = 0;                   // SD卡挂载状态
-static float sd_capacity = 0.0f;             // SD卡容量 (GB)
+static uint8_t frame[FRAME_BYTES];
+static UI_DateTime current_time;
+static UI_LastRead last_read;
+static UI_Page current_page = PAGE_MAIN;
+static uint16_t toc_highlight = 1;
+static uint8_t partial_count = 0;
+static int sd_mounted = 0;
+static float sd_capacity = 0.0f;
 
-// 平台级回调钩子（可在其他C文件中重写这些函数，以连接 Flash/NVS 存储）
+// Platform hooks. Override these in another C file to connect flash/NVS.
 __attribute__((weak)) void UI_SaveSettingsToStorage(uint8_t setting_index)
 {
     (void)setting_index;
@@ -187,7 +184,7 @@ static void put_pixel(int lx, int ly, int black)
 {
     if(lx < 0 || lx >= UI_W || ly < 0 || ly >= UI_H) return;
 
-    // 将逻辑横屏坐标旋转并映射到 128x296 的物理面板缓冲区
+    // Rotate logical landscape into the 128x296 physical panel buffer.
     int px = ly;
     int py = (EPD_PHYS_H - 1) - lx;
     int bi = (px >> 3) + py * EPD_ROW_BYTES;
@@ -517,15 +514,15 @@ static void draw_top_bar(void)
 
     make_date(date, (int)sizeof(date), &current_time);
     
-    // 像素复古风的反色顶部状态栏
+    // Pixel art style inverted top bar
     fill_rect(0, 0, UI_W, 32, 1);
     draw_text_ex(8, 8, date, 0, 1);
     
-    // 时间显示框
+    // Time box
     fill_rect(216, 2, 76, 28, 0);
     draw_time_24(224, 4, &current_time);
     
-    // 分割线
+    // Separator line
     hline(0, 32, UI_W, 0);
     hline(0, 33, UI_W, 1);
     hline(0, 34, UI_W, 1);
@@ -533,8 +530,8 @@ static void draw_top_bar(void)
 
 static void display_full(void)
 {
-    // 在进行大的页面切换时进行全屏刷新，以保持屏幕黑白对比度的纯净。
-    // 刷新完成后让面板进入休眠模式以节省静态功耗。
+    // Full refresh on every large page switch keeps the panel's black/white
+    // reference clean. The panel sleeps afterward to cut static power.
     EPD_2IN9_Init(EPD_2IN9_FULL);
     EPD_2IN9_DisplayWithBG(frame, 0, 0, 0);
     EPD_2IN9_Sleep();
@@ -562,12 +559,12 @@ static void render_header(const char *title)
 {
     frame_clear();
     
-    // 从路径中提取文件名，使标题栏保持整洁
+    // Extract filename from path to keep header clean
     const char *display_name = strrchr(title, '/');
     if (display_name) display_name++;
     else display_name = title;
 
-    // 截断至最多 20 个字符（最多 160 像素），避免与 X=180 处的进度文本重叠冲突
+    // Truncate to 20 cells (160 pixels max) to avoid colliding with progress text at X=180
     draw_text_max_cells(8, 8, display_name, 20, 1);
     hline(8, 32, 280, 1);
 }
@@ -599,14 +596,14 @@ static void render_main(void)
     fill_rect(26, 90, 12, 2, 1);
     fill_rect(26, 96, 16, 2, 1);
 
-    // 显示书籍标题
+    // Book title
     const char *display_name = strrchr(last_read.novel, '/');
-    if (display_name) display_name++; // 跳过 '/'
+    if (display_name) display_name++; // skip '/'
     else display_name = last_read.novel;
     if (display_name[0] == '\0') display_name = "未选择";
     draw_text_max_cells(56, 72, display_name, 26, 1);
     
-    // SD卡状态显示框
+    // SD Card Status Box
     int sd_box_x = 140;
     int sd_box_y = 108;
     int sd_box_w = 130;
@@ -626,7 +623,7 @@ static void render_main(void)
         make_progress(progress, (int)sizeof(progress));
         draw_text(56, 92, progress, 0);
         
-        // 底部进度条
+        // Progress bar
         int bar_x = 140;
         int bar_y = 94;
         int bar_w = 130;
@@ -660,7 +657,7 @@ static void render_main(void)
         if (fill_w > bar_w - 4) fill_w = bar_w - 4;
         
         if (fill_w > 0) {
-            // 像素风的点状填充
+            // Dotted fill for pixel style
             for (int px = 0; px < fill_w; px += 2) {
                 fill_rect(bar_x + 2 + px, bar_y + 2, 1, bar_h - 4, 1);
             }
@@ -687,7 +684,7 @@ static void scan_directory(const char *path) {
                 if ((fno.fattrib & AM_DIR) || !ends_with_txt(fno.fname)) {
                     continue;
                 }
-            } else if (file_filter_mode == FILTER_JSON) {
+            } else if (file_filter_mode == FILTER_JSON || file_filter_mode == FILTER_JSON_CMD) {
                 if ((fno.fattrib & AM_DIR) || !ends_with_json(fno.fname)) {
                     continue;
                 }
@@ -722,9 +719,10 @@ static void scan_directory(const char *path) {
 
 static const char *settings_menu[] = {
     "SD卡",
-    "模拟键盘"
+    "模拟键盘",
+    "同步电脑数据"
 };
-#define SETTINGS_MENU_COUNT 2
+#define SETTINGS_MENU_COUNT 3
 
 static void render_settings(void)
 {
@@ -1033,6 +1031,17 @@ static void enter_main(void)
     render_main();
     display_full();
 }
+void UI_ReturnToMain(void)
+{
+    current_page = PAGE_MAIN;
+    render_main();
+    display_full();
+}
+
+void UI_ForceSave(void)
+{
+    UI_SaveLastReadToStorage(&last_read);
+}
 
 static void enter_settings(void)
 {
@@ -1121,8 +1130,6 @@ void UI_UpdateClock(const UI_DateTime *now)
     render_main();
 
     if(!same_date(&old_time, now)) {
-        // 每次渲染页面时强制执行一次完整的 SD 卡读取
-        // 这是为了避免如果页面在内存中缓存过久，可能产生的闪烁或垃圾数据
         display_full();
     } else {
         // Minute changes touch only the top-right time rectangle.
@@ -1176,6 +1183,10 @@ void UI_HandleButton(UI_ButtonEvent event)
                     strcpy(current_dir_path, "0:/simulation");
                     // Ensure directory exists or ignore
                     enter_file_browser();
+                } else if (settings_index == 2) {
+                    file_filter_mode = FILTER_JSON_CMD;
+                    strcpy(current_dir_path, "0:/pc_cmd");
+                    enter_file_browser();
                 }
             }
         } else if (event == UI_BUTTON_DOUBLE) {
@@ -1221,7 +1232,7 @@ void UI_HandleButton(UI_ButtonEvent event)
                             file_filter_mode = FILTER_NONE;
                             enter_reading();
                         }
-                    } else if (file_filter_mode == FILTER_JSON && ends_with_json(item->name)) {
+                    } else if ((file_filter_mode == FILTER_JSON || file_filter_mode == FILTER_JSON_CMD) && ends_with_json(item->name)) {
                         char target_path[256];
                         snprintf(target_path, sizeof(target_path), "%s/%s", current_dir_path, item->name);
                         FIL fp;
@@ -1232,18 +1243,42 @@ void UI_HandleButton(UI_ButtonEvent event)
                             f_close(&fp);
                             
                             char *keys_start = strstr(buf, "\"keys\"");
+                            if (!keys_start) keys_start = strstr(buf, "\"cmd\""); // Support both formats
+                            
                             if (keys_start) {
-                                keys_start = strchr(keys_start + 6, '\"');
+                                keys_start = strchr(keys_start + 5, '\"');
                                 if (keys_start) {
                                     keys_start++;
-                                    char *keys_end = strchr(keys_start, '\"');
-                                    if (keys_end) {
+                                    char *keys_end = keys_start;
+                                    while (*keys_end) {
+                                        if (*keys_end == '\"' && *(keys_end - 1) != '\\') {
+                                            break;
+                                        }
+                                        keys_end++;
+                                    }
+                                    if (*keys_end == '\"') {
                                         *keys_end = '\0';
-                                        extern void start_typing(const char *text);
-                                        start_typing(keys_start);
+                                        // Unescape \" to "
+                                        char *src = keys_start;
+                                        char *dst = keys_start;
+                                        while (*src) {
+                                            if (*src == '\\' && *(src + 1) == '\"') {
+                                                src++; // Skip backslash
+                                            }
+                                            *dst++ = *src++;
+                                        }
+                                        *dst = '\0';
+                                        if (file_filter_mode == FILTER_JSON_CMD) {
+                                            extern void start_typing_cmd(const char *cmd);
+                                            start_typing_cmd(keys_start);
+                                            draw_text(16, 48, "正在同步电脑数据...", 0);
+                                        } else {
+                                            extern void start_typing(const char *text);
+                                            start_typing(keys_start);
+                                            draw_text(16, 48, "正在输出键盘指令...", 0);
+                                        }
                                         
                                         render_header(item->name);
-                                        draw_text(16, 48, "正在输出键盘指令...", 0);
                                         display_full();
                                     }
                                 }

@@ -13,8 +13,8 @@
 #include <tusb.h>
 
 // ============================================================
-// 按键 — GP0，低电平有效，内部上拉。
-//   短按 → 确认       双击 → 下一项/下一页        长按 → 返回/退出
+// Button — GP0, active-low, internal pull-up.
+//   Short  → confirm       Double → next        Long → back
 // ============================================================
 #define DEBOUNCE_MS  20
 #define LONG_MS      800
@@ -22,24 +22,24 @@
 #define TICK_MS      10
 
 // ============================================================
-// 简单的按键计数检测器（使用定时器轮询和状态机）。
-//   - 每次消抖后的按下会增加 click_count（点击计数）。
-//   - 在 DOUBLE_MS（双击超时时间）内按两次 → 触发双击，并重置计数。
-//   - 按一次，且释放后经过 DOUBLE_MS 仍无操作 → 触发短按。
-//   - 按住时间 >= LONG_MS → 触发长按，并重置计数。
+// Simple click-counting detector (no complex state machine).
+//   - Each debounced press increments click_count.
+//   - Two presses within DOUBLE_MS → DOUBLE, reset count.
+//   - One press + DOUBLE_MS silence after release → SHORT.
+//   - Held >= LONG_MS → LONG, reset count.
 // ============================================================
-static uint8_t  db_stable     = 0;   // 消抖后的按键电平状态
-static uint8_t  db_last_raw   = 0;   // 上一次原始采样电平
-static uint32_t db_changed_ms = 0;   // 上一次原始电平发生改变的时间戳
-static uint32_t db_down_ms    = 0;   // 上一次消抖后确认按下的时间
-static uint32_t db_up_ms      = 0;   // 上一次消抖后确认释放的时间
-static uint8_t  click_cnt     = 0;   // 累积的点击次数 (0, 1, 或 2)
-static uint8_t  long_done     = 0;   // 本次长按是否已经触发过（防重复触发）
+static uint8_t  db_stable     = 0;   // debounced button level
+static uint8_t  db_last_raw   = 0;   // previous raw sample
+static uint32_t db_changed_ms = 0;   // last raw-change timestamp
+static uint32_t db_down_ms    = 0;   // last debounced-press time
+static uint32_t db_up_ms      = 0;   // last debounced-release time
+static uint8_t  click_cnt     = 0;   // clicks accumulated (0, 1, or 2)
+static uint8_t  long_done     = 0;   // LONG already fired for this hold
 
 
 
 // ============================================================
-// 初始化按键
+// Init
 // ============================================================
 static void btn_init(void)
 {
@@ -56,7 +56,7 @@ static void btn_init(void)
 }
 
 // ============================================================
-// 轮询按键 — 每次调用返回一个事件（或返回 NONE 无事件）。
+// Poll — returns one event per call (or NONE).
 // ============================================================
 static UI_ButtonEvent btn_poll(uint32_t now)
 {
@@ -110,7 +110,7 @@ static UI_ButtonEvent btn_poll(uint32_t now)
 }
 
 // ============================================================
-// 定时器中断专用的事件队列（防丢失按键缓冲）
+// Event Queue for Timer ISR
 // ============================================================
 #define EVENT_QUEUE_SIZE 8
 static volatile UI_ButtonEvent btn_queue[EVENT_QUEUE_SIZE];
@@ -143,7 +143,7 @@ static bool btn_timer_callback(struct repeating_timer *t) {
 }
 
 // ============================================================
-// 日期 / 平台辅助函数
+// Date / platform helpers
 // ============================================================
 static int is_leap(uint16_t y)
 { return ((y % 4) == 0 && (y % 100) != 0) || ((y % 400) == 0); }
@@ -169,10 +169,14 @@ static void add_days(UI_DateTime *t, uint32_t days)
 }
 
 static UI_DateTime g_base_time = {2026,6,5,5,12,0};
+static uint8_t g_base_second = 0;
+static uint32_t rtc_offset_ms = 0;
 
 static void Platform_ReadRtc(UI_DateTime *o, uint32_t uptime_ms)
 {
-    uint32_t mins = uptime_ms / 60000UL;
+    uint32_t eff_uptime = (uptime_ms > rtc_offset_ms) ? (uptime_ms - rtc_offset_ms) : 0;
+    uint32_t total_seconds = (eff_uptime / 1000UL) + g_base_second;
+    uint32_t mins = total_seconds / 60UL;
     uint32_t tot  = (uint32_t)g_base_time.hour * 60 + g_base_time.minute + mins;
     uint32_t days = tot / 1440;
     tot %= 1440;
@@ -266,7 +270,7 @@ void UI_SaveLastReadToStorage(const UI_LastRead *l)
 }
 
 // ============================================================
-// 键盘 HID 模拟任务
+// Keyboard HID Task
 // ============================================================
 bool g_msc_enabled = false;
 
@@ -280,17 +284,31 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
     (void) instance; (void) report_id; (void) report_type; (void) buffer; (void) bufsize;
 }
 
-static char typing_buffer[256];
+static char typing_buffer[512];
 static int typing_index = 0;
 static bool is_typing = false;
+static bool is_typing_cmd = false;
+static uint8_t cmd_state = 0;
 static uint32_t typing_next_ms = 0;
 static bool key_pressed = false;
 
 void start_typing(const char *text) {
-    strncpy(typing_buffer, text, 255);
-    typing_buffer[255] = '\0';
+    strncpy(typing_buffer, text, 511);
+    typing_buffer[511] = '\0';
     typing_index = 0;
     is_typing = true;
+    is_typing_cmd = false;
+    key_pressed = false;
+    typing_next_ms = board_millis();
+}
+
+void start_typing_cmd(const char *cmd) {
+    strncpy(typing_buffer, cmd, 511);
+    typing_buffer[511] = '\0';
+    typing_index = 0;
+    is_typing = false;
+    is_typing_cmd = true;
+    cmd_state = 0;
     key_pressed = false;
     typing_next_ms = board_millis();
 }
@@ -304,16 +322,28 @@ static uint8_t char_to_keycode(char c, uint8_t *modifier) {
     if (c == ' ') return HID_KEY_SPACE;
     if (c == '\n') return HID_KEY_ENTER;
     if (c == '\t') return HID_KEY_TAB;
-    if (c == ',') return HID_KEY_COMMA;
-    if (c == '.') return HID_KEY_PERIOD;
-    if (c == '/') return HID_KEY_SLASH;
-    if (c == '-') return HID_KEY_MINUS;
-    if (c == '=') return HID_KEY_EQUAL;
     if (c == ';') return HID_KEY_SEMICOLON;
+    if (c == ':') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_SEMICOLON; }
     if (c == '\'') return HID_KEY_APOSTROPHE;
+    if (c == '"') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_APOSTROPHE; }
     if (c == '[') return HID_KEY_BRACKET_LEFT;
+    if (c == '{') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_BRACKET_LEFT; }
     if (c == ']') return HID_KEY_BRACKET_RIGHT;
+    if (c == '}') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_BRACKET_RIGHT; }
     if (c == '\\') return HID_KEY_BACKSLASH;
+    if (c == '|') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_BACKSLASH; }
+    if (c == ',') return HID_KEY_COMMA;
+    if (c == '<') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_COMMA; }
+    if (c == '.') return HID_KEY_PERIOD;
+    if (c == '>') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_PERIOD; }
+    if (c == '/') return HID_KEY_SLASH;
+    if (c == '?') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_SLASH; }
+    if (c == '-') return HID_KEY_MINUS;
+    if (c == '_') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_MINUS; }
+    if (c == '=') return HID_KEY_EQUAL;
+    if (c == '+') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_EQUAL; }
+    if (c == '`') return HID_KEY_GRAVE;
+    if (c == '~') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_GRAVE; }
     
     // Fallback for some symbols
     if (c == '!') { *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; return HID_KEY_1; }
@@ -331,47 +361,112 @@ static uint8_t char_to_keycode(char c, uint8_t *modifier) {
 }
 
 static void hid_task(void) {
-    if (!is_typing) return;
+    if (!is_typing && !is_typing_cmd) return;
     if (board_millis() < typing_next_ms) return;
     
     // Poll interval wait
     if (!tud_hid_ready()) return;
 
-    if (key_pressed) {
-        // Release key
-        tud_hid_keyboard_report(1, 0, NULL);
-        key_pressed = false;
-        typing_next_ms = board_millis() + 10;
-        typing_index++;
-    } else {
-        char c = typing_buffer[typing_index];
-        if (c == '\0') {
-            is_typing = false;
-            return;
+    if (is_typing_cmd) {
+        if (cmd_state == 0) {
+            if (key_pressed) {
+                tud_hid_keyboard_report(1, 0, NULL);
+                key_pressed = false;
+                cmd_state = 1;
+                typing_next_ms = board_millis() + 500; // wait 500ms for Run dialog
+            } else {
+                uint8_t keycode_arr[6] = {HID_KEY_R, 0, 0, 0, 0, 0};
+                tud_hid_keyboard_report(1, KEYBOARD_MODIFIER_LEFTGUI, keycode_arr);
+                key_pressed = true;
+                typing_next_ms = board_millis() + 50;
+            }
+        } else if (cmd_state == 1) {
+            // Typing characters
+            if (key_pressed) {
+                tud_hid_keyboard_report(1, 0, NULL);
+                key_pressed = false;
+                typing_next_ms = board_millis() + 2;
+                typing_index++;
+            } else {
+                char c = typing_buffer[typing_index];
+                if (c == '\0') {
+                    cmd_state = 2; // move to ENTER state
+                    typing_next_ms = board_millis() + 50;
+                    return;
+                }
+                
+                // Allow some standard characters missing from original
+                if (c == '"') {
+                    uint8_t keycode_arr[6] = {HID_KEY_APOSTROPHE, 0, 0, 0, 0, 0};
+                    tud_hid_keyboard_report(1, KEYBOARD_MODIFIER_LEFTSHIFT, keycode_arr);
+                    key_pressed = true;
+                    typing_next_ms = board_millis() + 2;
+                    return;
+                }
+                
+                uint8_t modifier = 0;
+                uint8_t keycode = char_to_keycode(c, &modifier);
+                
+                if (keycode != 0) {
+                    uint8_t keycode_arr[6] = {keycode, 0, 0, 0, 0, 0};
+                    tud_hid_keyboard_report(1, modifier, keycode_arr);
+                    key_pressed = true;
+                    typing_next_ms = board_millis() + 2;
+                } else {
+                    typing_index++;
+                }
+            }
+        } else if (cmd_state == 2) {
+            if (key_pressed) {
+                tud_hid_keyboard_report(1, 0, NULL);
+                key_pressed = false;
+                is_typing_cmd = false; // Done
+            } else {
+                uint8_t keycode_arr[6] = {HID_KEY_ENTER, 0, 0, 0, 0, 0};
+                tud_hid_keyboard_report(1, 0, keycode_arr);
+                key_pressed = true;
+                typing_next_ms = board_millis() + 50;
+            }
         }
-        
-        uint8_t modifier = 0;
-        uint8_t keycode = char_to_keycode(c, &modifier);
-        
-        if (keycode != 0) {
-            uint8_t keycode_arr[6] = {0};
-            keycode_arr[0] = keycode;
-            tud_hid_keyboard_report(1, modifier, keycode_arr);
-            key_pressed = true;
+        return;
+    }
+
+    if (is_typing) {
+        if (key_pressed) {
+            // Release key
+            tud_hid_keyboard_report(1, 0, NULL);
+            key_pressed = false;
             typing_next_ms = board_millis() + 10;
-        } else {
-            // Skip unknown chars
             typing_index++;
+        } else {
+            char c = typing_buffer[typing_index];
+            if (c == '\0') {
+                is_typing = false;
+                return;
+            }
+            
+            uint8_t modifier = 0;
+            uint8_t keycode = char_to_keycode(c, &modifier);
+            
+            if (keycode != 0) {
+                uint8_t keycode_arr[6] = {keycode, 0, 0, 0, 0, 0};
+                tud_hid_keyboard_report(1, modifier, keycode_arr);
+                key_pressed = true;
+                typing_next_ms = board_millis() + 10;
+            } else {
+                // Skip unknown chars
+                typing_index++;
+            }
         }
     }
 }
 
 // ============================================================
-// 主函数 Main
+// Main
 // ============================================================
 int main(void)
 {
-    // 初始化ialize the board for TinyUSB compatibility
+    // Initialize the board for TinyUSB compatibility
     board_init();
 
     // Configure Button (GP0) to check for USB MSC boot mode
@@ -391,14 +486,14 @@ int main(void)
         }
     }
 
-    // 初始化ialize USB for HID Simulation (MSC will be disabled via g_msc_enabled=false)
+    // Initialize USB for HID Simulation (MSC will be disabled via g_msc_enabled=false)
     tud_init(BOARD_TUD_RHPORT);
 
     // Normal Boot Mode (E-Ink Reader)
     UI_DateTime now;
     UI_LastRead last;
-    uint32_t tick = 0;
-    uint32_t last_clk = 0;
+    uint32_t tick = board_millis();
+    uint32_t last_clk = tick;
 
     stdio_init_all(); sleep_ms(2000);
     printf("\n=== E-Ink Reader RP2040 ===\n");
@@ -418,6 +513,9 @@ int main(void)
 
     static FATFS fs;
     FRESULT fr = f_mount(&fs, "0:", 1);
+    
+    extern void msc_flash_set_bat_code(const char* code);
+    
     if (fr == FR_OK) {
         DWORD fre_clust;
         FATFS *fs_ptr;
@@ -426,8 +524,47 @@ int main(void)
         UI_SetSdStatus(1, cap);
 
         // Dynamic scanning is handled by ui.c in PAGE_FILE_BROWSER
+        
+        // Setup Virtual Flash Drive files from pc-bat/ directory
+        DIR dir;
+        extern void msc_flash_clear(void);
+        msc_flash_clear();
+        
+        if (f_opendir(&dir, "0:pc-bat") == FR_OK) {
+            FILINFO fno;
+            while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
+                if (fno.fattrib & AM_DIR) continue;
+                
+                // Only process .json files
+                char* ext = strrchr(fno.fname, '.');
+                if (ext && (strcasecmp(ext, ".json") == 0)) {
+                    char filepath[256];
+                    snprintf(filepath, sizeof(filepath), "0:pc-bat/%s", fno.fname);
+                    
+                    FIL fil;
+                    if (f_open(&fil, filepath, FA_READ) == FR_OK) {
+                        UINT br;
+                        static char buf[1024]; // Large enough for json
+                        f_read(&fil, buf, sizeof(buf)-1, &br);
+                        buf[br] = '\0';
+                        f_close(&fil);
+                        
+                        extern void msc_flash_add_file(const char* filename, const char* code);
+                        msc_flash_add_file(fno.fname, buf);
+                    }
+                }
+            }
+            f_closedir(&dir);
+        } else {
+            // Fallback: create default time sync bat if pc-bat folder doesn't exist
+            extern void msc_flash_add_file(const char* filename, const char* code);
+            msc_flash_add_file("sync.json", NULL); // It will use default code
+        }
+        
     } else {
         UI_SetSdStatus(0, 0.0f);
+        extern void msc_flash_add_file(const char* filename, const char* code);
+        msc_flash_add_file("sync.json", NULL);
     }
 
     Platform_LoadLastRead(&last);
@@ -448,6 +585,41 @@ int main(void)
             UI_HandleButton(ev);
         }
 
+        // CDC Input Polling for PC Sync
+        int c = getchar_timeout_us(0);
+        while (c != PICO_ERROR_TIMEOUT) {
+            static char cdc_buf[64];
+            static int cdc_idx = 0;
+            
+            if (c == '\n' || c == '\r') {
+                cdc_buf[cdc_idx] = '\0';
+                if (strncmp(cdc_buf, "TIME:", 5) == 0) {
+                    // Expected format: TIME:2026,06,07,19,59,00
+                    int y, m, d, h, min, s;
+                    if (sscanf(cdc_buf + 5, "%d,%d,%d,%d,%d,%d", &y, &m, &d, &h, &min, &s) == 6) {
+                        now.year = y; now.month = m; now.day = d;
+                        now.hour = h; now.minute = min;
+                        
+                        // Update the base time for RTC calculation
+                        g_base_time = now;
+                        g_base_second = (uint8_t)s;
+                        rtc_offset_ms = tick;
+                        
+                        // Approximate weekday or ignore
+                        UI_UpdateClock(&now);
+                        // Force a re-render if we are in main page
+                        last_clk = tick; // Reset minute clock sync
+                        UI_ForceSave(); // Persist to settings.json
+                        UI_ReturnToMain(); // Jump back to main page and update screen
+                    }
+                }
+                cdc_idx = 0;
+            } else if (cdc_idx < 63) {
+                cdc_buf[cdc_idx++] = (char)c;
+            }
+            c = getchar_timeout_us(0);
+        }
+
         // Minute clock
         if ((uint32_t)(tick - last_clk) >= 1000UL) {
             Platform_ReadRtc(&now, tick);
@@ -456,6 +628,6 @@ int main(void)
         }
 
         sleep_ms(TICK_MS);
-        tick += TICK_MS;
+        tick = board_millis();
     }
 }

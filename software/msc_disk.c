@@ -41,6 +41,7 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 #include <tusb.h>
 //
 #include <pico/stdlib.h>
@@ -86,9 +87,101 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
  */
 extern bool g_msc_enabled;
 
+// ==============================================================================
+// Virtual Flash Drive Data (16KB total: 32 blocks of 512 bytes)
+// ==============================================================================
+static const uint8_t msc_disk_boot[512] = {
+  0xEB, 0x3C, 0x90, 0x4D, 0x53, 0x57, 0x49, 0x4E, 0x34, 0x2E, 0x31, 0x00, 0x02, 0x01, 0x01, 0x00,
+  0x01, 0x10, 0x00, 0x20, 0x00, 0xF8, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x29, 0x78, 0x56, 0x34, 0x12, 0x45, 0x49, 0x4E, 0x4B, 0x5F,
+  0x46, 0x4C, 0x41, 0x53, 0x48, 0x20, 0x46, 0x41, 0x54, 0x31, 0x32, 0x20, 0x20, 0x20, 0x00, 0x00,
+  [510] = 0x55, [511] = 0xAA
+};
+
+#define MAX_VFILES 15
+typedef struct {
+    char fat_name[11];
+    uint32_t size;
+    uint8_t data[512];
+} VFile_t;
+
+static VFile_t vfiles[MAX_VFILES];
+static int num_vfiles = 0;
+
+void msc_flash_clear(void) {
+    num_vfiles = 0;
+}
+
+// Default Time Sync payload if pc-cmd.json is missing or invalid.
+static const char* default_bat_code = "@echo off\r\npowershell -w h -c \"[IO.Ports.SerialPort]::GetPortNames()|%%{$s=[IO.Ports.SerialPort]$_;$s.DtrEnable=1;$s.open();$s.write('TIME:'+(get-date -f 'yy,M,d,H,m,s')+[char]10);$s.close()}\"\r\n";
+
+void msc_flash_add_file(const char* filename, const char* code) {
+    if (num_vfiles >= MAX_VFILES) return;
+    if (!code) code = default_bat_code;
+    
+    VFile_t* vf = &vfiles[num_vfiles];
+    memset(vf->fat_name, ' ', 11);
+    
+    // Parse filename to FAT 8.3
+    int name_len = 0;
+    for (int i = 0; i < 8 && filename[i] && filename[i] != '.'; i++) {
+        char c = filename[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        vf->fat_name[name_len++] = c;
+    }
+    vf->fat_name[8] = 'B';
+    vf->fat_name[9] = 'A';
+    vf->fat_name[10] = 'T';
+    
+    uint32_t len = strlen(code);
+    if (len > 512) len = 512;
+    vf->size = len;
+    
+    memset(vf->data, 0, 512);
+    memcpy(vf->data, code, len);
+    
+    num_vfiles++;
+}
+
+static void get_fat_block(uint8_t* buf) {
+    memset(buf, 0, 512);
+    buf[0] = 0xF8; buf[1] = 0xFF; buf[2] = 0xFF;
+    for (int i = 0; i < num_vfiles; i++) {
+        int cluster = 2 + i;
+        int byte_offset = (cluster * 3) / 2;
+        if (cluster % 2 == 0) {
+            buf[byte_offset] = 0xFF;
+            buf[byte_offset+1] |= 0x0F;
+        } else {
+            buf[byte_offset] |= 0xF0;
+            buf[byte_offset+1] = 0xFF;
+        }
+    }
+}
+
+static void get_root_block(uint8_t* buf) {
+    memset(buf, 0, 512);
+    memcpy(buf, "EINK_FLASH \x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 32);
+    
+    for (int i = 0; i < num_vfiles; i++) {
+        int offset = 32 + i * 32;
+        memcpy(buf + offset, vfiles[i].fat_name, 11);
+        buf[offset + 11] = 0x20; // Archive
+        buf[offset + 12] = 0x18; // NTRes: 0x08 (lowercase base) | 0x10 (lowercase ext)
+        uint16_t cluster = 2 + i;
+        buf[offset + 26] = cluster & 0xFF;
+        buf[offset + 27] = (cluster >> 8) & 0xFF;
+        uint32_t size = vfiles[i].size;
+        buf[offset + 28] = size & 0xFF;
+        buf[offset + 29] = (size >> 8) & 0xFF;
+        buf[offset + 30] = (size >> 16) & 0xFF;
+        buf[offset + 31] = (size >> 24) & 0xFF;
+    }
+}
+// ==============================================================================
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
     TRACE_PRINTF("%s(lun=%d)\n", __func__, lun);
-    if (!g_msc_enabled) return false;
+    if (!g_msc_enabled) return true; // Virtual Flash Drive is always ready
     DSTATUS ds = disk_initialize(lun);
     return (!(STA_NOINIT & ds) && !(STA_NODISK & ds));
 }
@@ -104,6 +197,13 @@ bool tud_msc_test_unit_ready_cb(uint8_t lun) {
  */
 void tud_msc_capacity_cb(uint8_t lun, uint32_t* block_count_p, uint16_t* block_size_p) {
     TRACE_PRINTF("%s(lun=%d)\n", __func__, lun);
+    if (!g_msc_enabled) {
+        // Virtual Flash Drive: 16KB (32 blocks of 512 bytes)
+        *block_count_p = 32;
+        *block_size_p = 512;
+        return;
+    }
+    
     if (!tud_msc_test_unit_ready_cb(lun)) {
         *block_count_p = 0;
     } else {
@@ -164,6 +264,23 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buff
     if (ejected) return -1;
     if (!tud_msc_test_unit_ready_cb(lun)) return -1;
 
+    if (!g_msc_enabled) {
+        // Virtual Flash Drive
+        if (lba >= 32) return -1;
+        uint8_t* ptr = (uint8_t*)buffer;
+        for (uint32_t i = 0; i < bufsize / 512; i++) {
+            uint32_t block = lba + i;
+            if (block == 0) memcpy(ptr + i * 512, msc_disk_boot, 512);
+            else if (block == 1) get_fat_block(ptr + i * 512);
+            else if (block == 2) get_root_block(ptr + i * 512);
+            else if (block >= 3 && block < 3 + num_vfiles) {
+                memcpy(ptr + i * 512, vfiles[block - 3].data, 512);
+            }
+            else memset(ptr + i * 512, 0, 512);
+        }
+        return (int32_t)bufsize;
+    }
+
     // Read data from the disk.
     DRESULT dr = disk_read(lun, (BYTE*)buffer, lba, bufsize / 512);
     if (RES_OK != dr) return -1;
@@ -181,6 +298,8 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buff
 bool tud_msc_is_writable_cb(uint8_t lun) {
     TRACE_PRINTF("%s(lun=%d)\n", __func__, lun);
     if (ejected) return false;
+    
+    if (!g_msc_enabled) return false; // Virtual Flash Drive is read-only
 
     DSTATUS ds = disk_status(lun);
     return !(STA_PROTECT & ds);
@@ -207,6 +326,11 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* 
 
     if (ejected) return -1;
     if (!tud_msc_test_unit_ready_cb(lun)) return -1;
+
+    if (!g_msc_enabled) {
+        // Virtual Flash Drive is read-only
+        return -1;
+    }
 
     // Write data to the disk.
     DRESULT dr = disk_write(lun, (BYTE*)buffer, lba, bufsize / 512);
