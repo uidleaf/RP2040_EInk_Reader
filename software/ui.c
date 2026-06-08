@@ -6,6 +6,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define UI_W 296
 #define UI_H 128
@@ -27,7 +28,9 @@ typedef enum {
     PAGE_TOC,
     PAGE_READING,
     PAGE_FILE_BROWSER,
-    PAGE_RESUME_PROMPT
+    PAGE_RESUME_PROMPT,
+    PAGE_FLASHCARD,
+    PAGE_FLASHCARD_MENU
 } UI_Page;
 
 #define MAX_BROWSER_ITEMS 50
@@ -40,9 +43,23 @@ static UI_FileItem browser_items[MAX_BROWSER_ITEMS];
 static int browser_item_count = 0;
 static int browser_index = 0;
 
-enum { FILTER_NONE = 0, FILTER_TXT, FILTER_JSON, FILTER_JSON_CMD };
+enum { FILTER_NONE = 0, FILTER_TXT, FILTER_JSON, FILTER_JSON_CMD, FILTER_ENGLISH };
 static int file_filter_mode = FILTER_NONE;
 static uint8_t settings_index = 0;
+
+// Flashcard Feature State
+#define FLASHCARD_MAX_WORDS 10000
+static char flashcard_txt[256] = "";
+static char flashcard_json[256] = "";
+static uint32_t flashcard_total_words = 0;
+static uint32_t flashcard_learned_count = 0;
+static uint8_t flashcard_learned_bits[FLASHCARD_MAX_WORDS / 8 + 1] = {0};
+static uint32_t flashcard_current_word = 0xFFFFFFFF;
+static char flashcard_word[64] = "";
+static char flashcard_meaning[128] = "";
+static uint8_t flashcard_menu_index = 0;
+static int flashcard_finished = 0;
+
 
 static int ends_with_txt(const char *name) {
     int len = strlen(name);
@@ -680,7 +697,7 @@ static void scan_directory(const char *path) {
         while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0) {
             if (fno.fattrib & (AM_HID | AM_SYS)) continue;
             
-            if (file_filter_mode == FILTER_TXT) {
+            if (file_filter_mode == FILTER_TXT || file_filter_mode == FILTER_ENGLISH) {
                 if ((fno.fattrib & AM_DIR) || !ends_with_txt(fno.fname)) {
                     continue;
                 }
@@ -1007,6 +1024,296 @@ static void render_reading(void)
     f_close(&fp);
 }
 
+// ==========================================
+// FLASHCARD FEATURE
+// ==========================================
+static uint8_t hex_to_nybble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+static int get_json_int(const char *json_str, const char *key, int default_val) {
+    char *ptr = strstr(json_str, key);
+    if (ptr) {
+        ptr += strlen(key);
+        while (*ptr == ' ' || *ptr == ':') ptr++;
+        return atoi(ptr);
+    }
+    return default_val;
+}
+
+static void init_flashcard_dict(const char *filename) {
+    strncpy(flashcard_txt, filename, 255);
+    flashcard_txt[255] = '\0';
+    flashcard_total_words = 0;
+    flashcard_learned_count = 0;
+    memset(flashcard_learned_bits, 0, sizeof(flashcard_learned_bits));
+    flashcard_current_word = 0xFFFFFFFF;
+    flashcard_finished = 0;
+    flashcard_word[0] = '\0';
+    flashcard_meaning[0] = '\0';
+
+    if (!sd_mounted) return;
+
+    FIL fp;
+    if (f_open(&fp, flashcard_txt, FA_READ) == FR_OK) {
+        if (f_size(&fp) > 0) {
+            flashcard_total_words = 0;
+            char buf[512];
+            UINT br;
+            int last_char = '\n';
+            while (f_read(&fp, buf, sizeof(buf), &br) == FR_OK && br > 0) {
+                for (UINT i = 0; i < br; i++) {
+                    if (buf[i] == '\n') flashcard_total_words++;
+                    last_char = buf[i];
+                }
+            }
+            if (last_char != '\n') flashcard_total_words++;
+        }
+        f_close(&fp);
+    }
+    
+    if (flashcard_total_words > FLASHCARD_MAX_WORDS) {
+        flashcard_total_words = FLASHCARD_MAX_WORDS;
+    }
+
+    strncpy(flashcard_json, filename, 255);
+    flashcard_json[255] = '\0';
+    char *ext = strrchr(flashcard_json, '.');
+    if (ext) {
+        strcpy(ext, ".json");
+    } else {
+        strcat(flashcard_json, ".json");
+    }
+
+    if (f_open(&fp, flashcard_json, FA_READ) == FR_OK) {
+        char buf[512] = {0};
+        UINT br;
+        f_read(&fp, buf, sizeof(buf) - 1, &br);
+        f_close(&fp);
+
+        char *ptr;
+        flashcard_learned_count = get_json_int(buf, "\"learned_count\"", 0);
+        
+        if ((ptr = strstr(buf, "\"learned_bits\""))) {
+            ptr = strchr(ptr, ':');
+            if (ptr && (ptr = strchr(ptr, '\"'))) {
+                ptr++;
+                size_t byte_idx = 0;
+                while (*ptr && *ptr != '\"' && byte_idx < sizeof(flashcard_learned_bits)) {
+                    uint8_t high = hex_to_nybble(*ptr++);
+                    if (!*ptr || *ptr == '\"') break;
+                    uint8_t low = hex_to_nybble(*ptr++);
+                    flashcard_learned_bits[byte_idx++] = (high << 4) | low;
+                }
+            }
+        }
+    }
+}
+
+static void save_flashcard_progress(void) {
+    if (!sd_mounted) return;
+    FIL fp;
+    if (f_open(&fp, flashcard_json, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "{\n  \"learned_count\": %lu,\n  \"learned_bits\": \"", flashcard_learned_count);
+        UINT bw;
+        f_write(&fp, buf, strlen(buf), &bw);
+        
+        int bytes_to_write = (flashcard_total_words + 7) / 8;
+        for (int i = 0; i < bytes_to_write; i++) {
+            snprintf(buf, sizeof(buf), "%02X", flashcard_learned_bits[i]);
+            f_write(&fp, buf, 2, &bw);
+        }
+        
+        const char *end = "\"\n}\n";
+        f_write(&fp, end, strlen(end), &bw);
+        f_close(&fp);
+    }
+}
+
+static void pick_flashcard_word(void) {
+    if (flashcard_total_words == 0 || flashcard_learned_count >= flashcard_total_words) {
+        flashcard_finished = 1;
+        return;
+    }
+    
+    flashcard_finished = 0;
+    uint32_t w = 0;
+    uint32_t attempts = 0;
+    do {
+        w = (uint32_t)rand() % flashcard_total_words;
+        attempts++;
+        if (attempts > flashcard_total_words * 2) {
+            for (uint32_t i = 0; i < flashcard_total_words; i++) {
+                if ((flashcard_learned_bits[i / 8] & (1 << (i % 8))) == 0) {
+                    w = i;
+                    break;
+                }
+            }
+            break;
+        }
+    } while (flashcard_learned_bits[w / 8] & (1 << (w % 8)));
+    
+    flashcard_current_word = w;
+    flashcard_word[0] = '\0';
+    flashcard_meaning[0] = '\0';
+    
+    FIL fp;
+    if (f_open(&fp, flashcard_txt, FA_READ) == FR_OK) {
+        uint32_t line_idx = 0;
+        char buf[512];
+        while (f_gets(buf, sizeof(buf), &fp)) {
+            int len = strlen(buf);
+            int has_nl = (len > 0 && buf[len-1] == '\n');
+            
+            if (line_idx == w) {
+                while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) {
+                    buf[--len] = '\0';
+                }
+                char *sep = strchr(buf, '\t');
+                if (!sep) sep = strchr(buf, ' ');
+                if (sep) {
+                    *sep = '\0';
+                    strncpy(flashcard_word, buf, sizeof(flashcard_word)-1);
+                    strncpy(flashcard_meaning, sep + 1, sizeof(flashcard_meaning)-1);
+                    char *m = flashcard_meaning;
+                    while (*m == ' ' || *m == '\t') m++;
+                    if (m != flashcard_meaning) {
+                        memmove(flashcard_meaning, m, strlen(m) + 1);
+                    }
+                } else {
+                    strncpy(flashcard_word, buf, sizeof(flashcard_word)-1);
+                }
+                break;
+            }
+            
+            if (has_nl || f_eof(&fp)) {
+                line_idx++;
+            }
+        }
+        f_close(&fp);
+    }
+}
+
+static void render_flashcard(void) {
+    frame_clear();
+    
+    const char *display_name = strrchr(flashcard_txt, '/');
+    if (display_name) display_name++;
+    else display_name = flashcard_txt;
+    
+    char header[64];
+    snprintf(header, sizeof(header), "单词卡 - %s", display_name);
+    draw_text_max_cells(8, 8, header, 16, 1);
+    hline(8, 32, 280, 1);
+    
+    if (flashcard_finished) {
+        draw_text(8, 56, "学习结束", 0);
+        draw_text(8, 80, "请长按选择下一个文档", 0);
+    } else if (flashcard_total_words == 0) {
+        draw_text(8, 56, "文档为空或读取失败", 0);
+    } else {
+        char prog[32];
+        snprintf(prog, sizeof(prog), "进度: %lu / %lu", flashcard_learned_count, flashcard_total_words);
+        draw_text(160, 8, prog, 1);
+        
+        draw_text_max_cells(16, 48, flashcard_word, 30, 1);
+        
+        int x = 16;
+        int y = 72;
+        int max_cells = 32;
+        
+        char *p = flashcard_meaning;
+        while (*p && y <= 96) {
+            char chunk[64];
+            int cells = 0;
+            const char *scan = p;
+            while (*scan && cells < max_cells) {
+                uint16_t u = decode_utf8(&scan);
+                int w = (u < 0x80) ? 1 : 2;
+                if (cells + w > max_cells) break;
+                cells += w;
+            }
+            int bytes = scan - p;
+            if (bytes > 63) bytes = 63;
+            memcpy(chunk, p, bytes);
+            chunk[bytes] = '\0';
+            
+            draw_text_max_cells(x, y, chunk, max_cells, 1);
+            p += bytes;
+            y += 16;
+        }
+        
+        draw_text_max_cells(8, 112, "短按: 认识/下一个   长按: 菜单", 34, 1);
+    }
+}
+
+static void render_flashcard_menu(void) {
+    render_flashcard();
+    
+    int bx = 40, by = 30, bw = 216, bh = 68;
+    fill_rect(bx, by, bw, bh, 1);
+    fill_rect(bx+2, by+2, bw-4, bh-4, 0);
+    
+    draw_text_ex(bx + 10, by + 6, "单词卡菜单", 0, 1);
+    hline(bx + 10, by + 24, bw - 20, 1);
+    
+    const char *opts[] = {"换一个文档", "退出到主页"};
+    for (int i = 0; i < 2; i++) {
+        int opt_y = by + 30 + i * 18;
+        char buf[32];
+        if (i == flashcard_menu_index) {
+            fill_rect(bx + 8, opt_y - 1, bw - 16, 18, 1);
+            snprintf(buf, sizeof(buf), "> %s", opts[i]);
+            draw_text_ex(bx + 12, opt_y, buf, 0, 1);
+        } else {
+            snprintf(buf, sizeof(buf), "  %s", opts[i]);
+            draw_text(bx + 12, opt_y, buf, 0);
+        }
+    }
+}
+
+static void enter_file_browser(void);
+
+static void enter_flashcard(void) {
+    current_page = PAGE_FLASHCARD;
+    
+    // DEBUG: Show we entered the function
+    frame_clear();
+    draw_text(16, 48, "进入单词卡 (Debug)", 0);
+    display_full();
+    // Wait a second to let user see it
+    for(volatile int i=0; i<10000000; i++);
+
+    if (flashcard_total_words == 0 || flashcard_finished) {
+        if (flashcard_txt[0] == '\0') {
+            file_filter_mode = FILTER_ENGLISH;
+            strcpy(current_dir_path, "0:/english");
+            enter_file_browser();
+            return;
+        }
+    }
+    
+    if (!flashcard_finished && flashcard_word[0] == '\0') {
+        pick_flashcard_word();
+    }
+    
+    render_flashcard();
+    display_full();
+}
+
+static void enter_flashcard_menu(void) {
+    current_page = PAGE_FLASHCARD_MENU;
+    flashcard_menu_index = 0;
+    render_flashcard_menu();
+    display_partial_landscape(0, 0, UI_W, UI_H);
+}
+
+
+
 static void render_resume_prompt(void)
 {
     render_header("Resume Reading?");
@@ -1168,6 +1475,8 @@ void UI_HandleButton(UI_ButtonEvent event)
             file_filter_mode = FILTER_TXT;
             strcpy(current_dir_path, "0:");
             enter_file_browser();
+        } else if (event == UI_BUTTON_LONG) {
+            enter_flashcard();
         }
         break;
 
@@ -1219,7 +1528,10 @@ void UI_HandleButton(UI_ButtonEvent event)
                             snprintf(target_path, sizeof(target_path), "%s/%s", current_dir_path, item->name);
                         }
                         
-                        if (strcmp(last_read.novel, target_path) == 0 && last_read.page > 1) {
+                        if (file_filter_mode == FILTER_ENGLISH) {
+                            init_flashcard_dict(target_path);
+                            enter_flashcard();
+                        } else if (strcmp(last_read.novel, target_path) == 0 && last_read.page > 1) {
                             file_filter_mode = FILTER_NONE;
                             enter_resume_prompt();
                         } else {
@@ -1375,6 +1687,52 @@ void UI_HandleButton(UI_ButtonEvent event)
             }
         } else if (event == UI_BUTTON_LONG) {
             enter_main();
+        }
+        break;
+
+    case PAGE_FLASHCARD:
+        if (event == UI_BUTTON_SHORT) {
+            if (!flashcard_finished && flashcard_current_word != 0xFFFFFFFF) {
+                uint32_t w = flashcard_current_word;
+                if ((flashcard_learned_bits[w / 8] & (1 << (w % 8))) == 0) {
+                    flashcard_learned_bits[w / 8] |= (1 << (w % 8));
+                    flashcard_learned_count++;
+                    save_flashcard_progress();
+                }
+                pick_flashcard_word();
+                render_flashcard();
+                display_full();
+            } else if (flashcard_finished) {
+                file_filter_mode = FILTER_ENGLISH;
+                strcpy(current_dir_path, "0:/english");
+                enter_file_browser();
+            }
+        } else if (event == UI_BUTTON_DOUBLE) {
+            if (flashcard_finished) {
+                file_filter_mode = FILTER_ENGLISH;
+                strcpy(current_dir_path, "0:/english");
+                enter_file_browser();
+            }
+        } else if (event == UI_BUTTON_LONG) {
+            enter_flashcard_menu();
+        }
+        break;
+
+    case PAGE_FLASHCARD_MENU:
+        if (event == UI_BUTTON_SHORT) {
+            if (flashcard_menu_index == 0) {
+                file_filter_mode = FILTER_ENGLISH;
+                strcpy(current_dir_path, "0:/english");
+                enter_file_browser();
+            } else if (flashcard_menu_index == 1) {
+                UI_ReturnToMain();
+            }
+        } else if (event == UI_BUTTON_DOUBLE) {
+            flashcard_menu_index = (flashcard_menu_index + 1) % 2;
+            render_flashcard_menu();
+            display_partial_landscape(0, 0, UI_W, UI_H);
+        } else if (event == UI_BUTTON_LONG) {
+            enter_flashcard();
         }
         break;
     }
